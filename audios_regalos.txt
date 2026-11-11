@@ -1,0 +1,8 @@
+
+# Audios específicos por regalo (se recarga solo al guardar este archivo).
+# Formato:  alias1, alias2 | archivo | solo
+quiereme | among us imposter sound effect.wav
+capibara, capybara | Anime Wow - Sound Effect SowaSFX.wav
+corazon, corazones | Cute Onii Chan Sound Effect Soundboard Link 🔽🔽.wav
+sombrero y bigote, sombreros y bigote | Avast - Audio Se ha Detectado una Amenaza.wav
+rosquilla, rosquillas, dona, donas, donut, doughnut | No La Polizia Sound Effect #Meme #Shorts.wav

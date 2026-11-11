@@ -1,0 +1,84 @@
+============================================================
+  VOCES BOTS - Guia de Instalacion
+============================================================
+
+1. INSTALACION (2 minutos)
+---------------------------
+   a) Descomprime VocesBots_Cliente.zip en una carpeta
+      (ej: C:\VocesBots\)
+
+   b) Doble clic a "VocesBots.exe"
+
+   c) Si Windows muestra "Windows protegio tu PC":
+      -> Clic en "Mas informacion"
+      -> Clic en "Ejecutar de todos modos"
+      (Solo la primera vez)
+
+2. LICENCIA (1 minuto)
+------------------------
+   a) Al abrir, veras un mensaje pidiendo licencia
+
+   b) Copia el "ID de este equipo" (boton Copiar ID)
+
+   c) Envia ese ID al desarrollador:
+      WhatsApp: +XX XXX XXX XXXX
+      Telegram: @tu_usuario
+
+   d) Recibiras un archivo "licencia.key"
+
+   e) Colocalo JUNTO a VocesBots.exe
+
+   f) Vuelve a abrir VocesBots.exe -> listo
+
+3. CONFIGURACION (5 minutos)
+-----------------------------
+   a) En el dashboard, boton "Live: @usuario"
+      -> Escribe tu usuario de TikTok del live
+
+   b) Boton "Clave API"
+      -> Pega tu clave de Fish Audio
+
+   c) Boton "Iniciar lector"
+      -> Empieza a leer el chat
+
+   d) Boton "Iniciar puente"
+      -> Conecta con tu live de TikTok
+      (la primera vez tarda 1-2 min porque instala Python)
+
+4. REQUISITOS
+--------------
+   * Windows 10 21H2 o superior (Windows 11 recomendado)
+   * Conexion a internet estable
+   * 500 MB libres en disco
+   * Microfono/altavoces (para escuchar las voces)
+
+   * Python se instala automaticamente
+   * Java NO hace falta instalarlo (viene incluido)
+
+5. PROBLEMAS COMUNES
+---------------------
+   P: "Windows bloqueo la app"
+   R: Normal en apps de desarrolladores independientes.
+      Ver seccion 1.c
+
+   P: "No se puede conectar a TikTok"
+   R: Asegurate de tener un live ACTIVO en ese momento.
+      El bot solo funciona cuando estas transmitiendo.
+
+   P: "No se escuchan las voces"
+   R: Verifica el volumen en el dashboard (arriba derecha).
+      Verifica que fish_api.key sea valida.
+
+   P: "Python no instalado"
+   R: Descarga de: https://www.python.org/downloads/
+      MARCA "Add Python to PATH" al instalar
+
+6. SOPORTE
+-----------
+   WhatsApp: +XX XXX XXX XXXX
+   Telegram: @tu_usuario
+   Email:    tu@email.com
+
+============================================================
+  Gracias por tu compra. Disfruta de Voces Bots
+============================================================
