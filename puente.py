@@ -58,22 +58,42 @@ RANGOS_PERMITIDOS = [
 # Signos de puntuación comunes que NO cuentan como "letras"
 PUNTUACION_PERMITIDA = set(" .,!?;:'\"-()[]{}¡¿…:—–@#&*/\\、。！？：；「」『』（）・〜ー～_")
 
+def _letra_permitida(o):
+    for lo, hi in RANGOS_PERMITIDOS:
+        if lo <= o <= hi:
+            return True
+    return False
+
 def idioma_permitido(texto):
     """True si el texto está en chino, coreano, japonés, español o inglés.
-       Rechaza árabe, cirílico, tailandés, hebreo, emojis mayoritarios, etc."""
+       Los emojis, símbolos, números y puntuación NO cuentan: solo se evalúan
+       las LETRAS. Si el mensaje empieza con @menciones de nombres en otro
+       alfabeto (árabe, etc.), se saltan esas palabras y se evalúa el resto."""
     if not texto:
         return False
+    palabras = texto.split()
+    if palabras and palabras[0].startswith("@"):
+        i = 0
+        while i < len(palabras):
+            w = palabras[i]
+            letras_w = [c for c in w if c.isalpha()]
+            fuera = [c for c in letras_w if not _letra_permitida(ord(c))]
+            es_mencion_ajena = (i == 0) or fuera or not letras_w
+            if es_mencion_ajena and (fuera or not letras_w or w.startswith("@")):
+                i += 1
+            else:
+                break
+        resto = " ".join(palabras[i:])
+        if any(c.isalpha() for c in resto):
+            texto = resto
     total = 0
     permitidos = 0
     for ch in texto:
-        if ch in PUNTUACION_PERMITIDA or ch.isspace() or ch.isdigit():
+        if not ch.isalpha():
             continue
-        o = ord(ch)
         total += 1
-        for lo, hi in RANGOS_PERMITIDOS:
-            if lo <= o <= hi:
-                permitidos += 1
-                break
+        if _letra_permitida(ord(ch)):
+            permitidos += 1
     if total == 0:
         return False
     return (permitidos / total) >= 0.6
@@ -144,8 +164,7 @@ try:
     from TikTokLive.events import LikeEvent
     TAP_DISPONIBLE = True
 except ImportError:
-    TAP_DISPONIBLE = False
-    print("[AVISO] Este TikTokLive no expone LikeEvent. Actualiza: pip install -U TikTokLive")
+    TAP_DISPONIBLE = False   # el aviso se muestra en monitor_usuario, solo si se usa TikTok
 
 PAQUETES_COMUNES = [
     ["TikTokLive", "TikTokLive"],
@@ -386,8 +405,8 @@ def limpiar_atexit():
 
 atexit.register(limpiar_atexit)
 
-COOLDOWN_USUARIO = 8
-COOLDOWN_GLOBAL  = 1.5
+COOLDOWN_USUARIO = 4
+COOLDOWN_GLOBAL  = 0.0   # antes 1.5: descartaba mensajes normales; la cola del Java ya regula
 LONGITUD_MIN     = 3 
 LONGITUD_MAX     = 150
 IGNORAR_RISAS    = True
@@ -511,6 +530,13 @@ def es_comentario_valido(usuario, mensaje_box):
     # 1) Advertencia de "regálame" (se hace sobre el original)
     if PATRON_REGALAME.search(mensaje):
         registrar_evento_regalame(usuario)
+        return False
+
+    # 1b) Quitar emotes de TikTok tipo [wow] [heart] [rockyloveit] y no leer
+    #     mensajes que son solo @menciones (+ emojis) sin texto propio
+    mensaje = re.sub(r"\[[A-Za-z0-9_]+\]", "", mensaje).strip()
+    mensaje_box[0] = mensaje
+    if not any(c.isalpha() for c in re.sub(r"@\S+", "", mensaje)):
         return False
 
     # 2) FILTRO DE IDIOMA: solo chino, coreano, japonés, español e inglés
@@ -837,6 +863,9 @@ async def monitor_usuario(usuario):
         SHARE_DISPONIBLE = True
     except ImportError: SHARE_DISPONIBLE = False
 
+    if not TAP_DISPONIBLE:
+        print("[AVISO] Este TikTokLive no expone LikeEvent. Actualiza: pip install -U TikTokLive")
+
     client = TikTokLiveClient(unique_id=f"@{usuario}")
 
     @client.on(ConnectEvent)
@@ -994,6 +1023,423 @@ async def monitor_usuario(usuario):
             print(f"[TIKTOK @{usuario}] Error: {e}. Reintentando en 10s...")
             await asyncio.sleep(10)
 
+# ============================================================
+# KICK  (API oficial + webhooks firmados)
+# ============================================================
+# Flujo:  Kick --POST firmado--> túnel público --> 127.0.0.1:<puerto Kick>
+# - Se usa un puerto APARTE del de TikFinity (8832) para que el túnel solo
+#   exponga webhooks firmados por Kick y nunca el endpoint genérico de chat.
+# - Todo con librería estándar (sin pip): la firma RSA se verifica a mano.
+import base64
+import hashlib
+import hmac
+import datetime as _dt
+import urllib.parse
+import urllib.error
+from collections import OrderedDict
+from http.server import ThreadingHTTPServer
+
+ARCHIVO_KICK_CONFIG = "kick_config.txt"
+KICK_API            = "https://api.kick.com/public/v1"
+KICK_OAUTH_TOKEN    = "https://id.kick.com/oauth/token"
+KICK_PUERTO_DEFECTO = 8833
+KICK_EVENTOS = [
+    ("chat.message.sent", 1),
+    ("channel.followed", 1),
+    ("channel.subscription.new", 1),
+    ("channel.subscription.renewal", 1),
+    ("channel.subscription.gifts", 1),
+    ("kicks.gifted", 1),
+]
+KICK_TOLERANCIA_SEG = 900    # antigüedad máxima aceptada de un webhook
+KICK_REVISION_SEG   = 900    # cada cuánto se revisa que sigan las suscripciones
+PATRON_EMOTE_KICK   = re.compile(r"\[emote:\d+:[^\]]*\]")
+
+def cargar_kick_config():
+    cfg = {"client_id": "", "client_secret": "", "canal": "", "puerto": str(KICK_PUERTO_DEFECTO)}
+    try:
+        if os.path.exists(ARCHIVO_KICK_CONFIG):
+            with open(ARCHIVO_KICK_CONFIG, "r", encoding="utf-8") as f:
+                for linea in f:
+                    t = linea.strip()
+                    if not t or t.startswith("#") or "=" not in t: continue
+                    clave, valor = t.split("=", 1)
+                    clave = clave.strip()
+                    if clave in cfg: cfg[clave] = valor.strip()
+    except Exception as e:
+        print(f"[AVISO] No se pudo leer {ARCHIVO_KICK_CONFIG}: {e}")
+    canal = cfg["canal"].strip().lstrip("@")
+    if "/" in canal: canal = canal.rstrip("/").rsplit("/", 1)[-1]   # acepta https://kick.com/usuario
+    cfg["canal"] = canal.lower()
+    return cfg
+
+KICK_CFG = cargar_kick_config()
+
+# Plataforma elegida en el dashboard (botón "Plataforma"): tiktok | kick | ambas
+ARCHIVO_PLATAFORMA = "plataforma.txt"
+
+def cargar_plataforma():
+    try:
+        if os.path.exists(ARCHIVO_PLATAFORMA):
+            with open(ARCHIVO_PLATAFORMA, "r", encoding="utf-8-sig") as f:
+                for linea in f:
+                    t = linea.strip().lower()
+                    if t and not t.startswith("#"):
+                        return t if t in ("kick", "ambas") else "tiktok"
+    except Exception as e:
+        print(f"[AVISO] No se pudo leer {ARCHIVO_PLATAFORMA}: {e}")
+    return "tiktok"
+
+PLATAFORMA = cargar_plataforma()
+
+def kick_configurado():
+    return all([KICK_CFG.get("client_id"), KICK_CFG.get("client_secret"), KICK_CFG.get("canal")])
+
+def kick_activo():
+    return PLATAFORMA in ("kick", "ambas") and kick_configurado()
+
+def _kick_puerto():
+    try:
+        p = int(KICK_CFG.get("puerto") or KICK_PUERTO_DEFECTO)
+        if 1024 <= p <= 65535 and p != HTTP_PORT: return p
+    except ValueError: pass
+    return KICK_PUERTO_DEFECTO
+
+_kick = {"token": "", "token_exp": 0.0, "broadcaster_id": None, "clave": None}
+_kick_ids_vistos = OrderedDict()
+_lock_kick = threading.Lock()
+
+# ---------------- RSA PKCS#1 v1.5 + SHA-256 (solo verificar) ----------------
+_SHA256_DIGESTINFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+def _der_leer(b, i):
+    """Lee un TLV DER en el offset i -> (tag, inicio_contenido, fin_contenido)."""
+    tag = b[i]; i += 1
+    largo = b[i]; i += 1
+    if largo & 0x80:
+        n = largo & 0x7F
+        if n == 0 or n > 4: raise ValueError("DER: longitud no soportada")
+        largo = int.from_bytes(b[i:i + n], "big"); i += n
+    if i + largo > len(b): raise ValueError("DER: truncado")
+    return tag, i, i + largo
+
+def _rsa_cargar_pem(pem):
+    cuerpo = "".join(l.strip() for l in pem.strip().splitlines() if l.strip() and not l.strip().startswith("-----"))
+    der = base64.b64decode(cuerpo)
+    tag, ini, _ = _der_leer(der, 0)
+    if tag != 0x30: raise ValueError("clave pública no válida")
+    tag2, _, fin2 = _der_leer(der, ini)
+    if tag2 == 0x30:                                   # SubjectPublicKeyInfo
+        tag3, i3, f3 = _der_leer(der, fin2)            # BIT STRING
+        if tag3 != 0x03: raise ValueError("clave pública no válida")
+        interior = der[i3 + 1:f3]                      # salta el byte de bits sin usar
+        tag4, ini4, _ = _der_leer(interior, 0)
+        if tag4 != 0x30: raise ValueError("clave pública no válida")
+        datos, off = interior, ini4
+    else:                                              # PKCS#1: SEQUENCE { n, e }
+        datos, off = der, ini
+    t1, a1, b1 = _der_leer(datos, off)
+    t2, a2, b2 = _der_leer(datos, b1)
+    if t1 != 0x02 or t2 != 0x02: raise ValueError("clave pública no válida")
+    return int.from_bytes(datos[a1:b1], "big"), int.from_bytes(datos[a2:b2], "big")
+
+def _rsa_verificar(clave, mensaje, firma):
+    n, e = clave
+    k = (n.bit_length() + 7) // 8
+    if len(firma) != k: return False
+    s = int.from_bytes(firma, "big")
+    if s >= n: return False
+    em = pow(s, e, n).to_bytes(k, "big")
+    t = _SHA256_DIGESTINFO + hashlib.sha256(mensaje).digest()
+    if k < len(t) + 11: return False
+    esperado = b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+    return hmac.compare_digest(em, esperado)
+
+def _rfc3339_a_epoch(ts):
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$", (ts or "").strip())
+    if not m: raise ValueError("timestamp no válido")
+    zona = m.group(2)
+    if not zona or zona == "Z": zona = "+00:00"
+    return _dt.datetime.fromisoformat(m.group(1) + zona).timestamp()
+
+# ---------------- Cliente HTTP mínimo ----------------
+def _resumen(obj, n=200):
+    t = obj if isinstance(obj, str) else json.dumps(obj, ensure_ascii=False)
+    return t[:n]
+
+def _kick_http(metodo, url, token="", json_body=None, form=None, timeout=20):
+    cab = {"Accept": "application/json", "User-Agent": "PuenteVoces/1.0"}
+    datos = None
+    if token: cab["Authorization"] = f"Bearer {token}"
+    if json_body is not None:
+        datos = json.dumps(json_body).encode("utf-8"); cab["Content-Type"] = "application/json"
+    elif form is not None:
+        datos = urllib.parse.urlencode(form).encode("utf-8"); cab["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=datos, headers=cab, method=metodo)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            estado, crudo = r.status, r.read()
+    except urllib.error.HTTPError as e:
+        estado, crudo = e.code, (e.read() or b"")
+    texto = crudo.decode("utf-8", "replace")
+    try: return estado, (json.loads(texto) if texto else {})
+    except ValueError: return estado, texto
+
+def _kick_obtener_token():
+    ahora = time.time()
+    if _kick["token"] and ahora < _kick["token_exp"] - 120: return _kick["token"]
+    st, d = _kick_http("POST", KICK_OAUTH_TOKEN, form={
+        "grant_type": "client_credentials",
+        "client_id": KICK_CFG["client_id"], "client_secret": KICK_CFG["client_secret"]})
+    if st != 200 or not isinstance(d, dict) or not d.get("access_token"):
+        raise RuntimeError(f"No se pudo obtener el token de Kick (HTTP {st}). Revisa client_id y client_secret. {_resumen(d)}")
+    _kick["token"] = d["access_token"]
+    try: dur = float(d.get("expires_in") or 3600)
+    except (TypeError, ValueError): dur = 3600.0
+    _kick["token_exp"] = ahora + dur
+    return _kick["token"]
+
+def _kick_resolver_canal(token):
+    slug = KICK_CFG["canal"]
+    st, d = _kick_http("GET", f"{KICK_API}/channels?slug={urllib.parse.quote(slug)}", token)
+    datos = d.get("data") if isinstance(d, dict) else None
+    if isinstance(datos, list): datos = datos[0] if datos else None
+    bid = datos.get("broadcaster_user_id") if isinstance(datos, dict) else None
+    if st != 200 or not bid:
+        raise RuntimeError(f"No se encontró el canal '{slug}' en Kick (HTTP {st}). Usa el nombre exacto de kick.com/<canal>. {_resumen(d)}")
+    return int(bid)
+
+def _buscar_pem(obj):
+    if isinstance(obj, str): return obj if "-----BEGIN" in obj else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            r = _buscar_pem(v)
+            if r: return r
+    if isinstance(obj, list):
+        for v in obj:
+            r = _buscar_pem(v)
+            if r: return r
+    return None
+
+def _kick_cargar_clave(token=""):
+    st, d = _kick_http("GET", f"{KICK_API}/public-key", token)
+    pem = _buscar_pem(d)
+    if st != 200 or not pem:
+        raise RuntimeError(f"No se pudo obtener la clave pública de Kick (HTTP {st}). {_resumen(d)}")
+    _kick["clave"] = _rsa_cargar_pem(pem)
+
+def _kick_asegurar_suscripciones(token, bid):
+    """Crea solo las suscripciones que falten. Devuelve la lista de errores por evento."""
+    existentes = set()
+    st, d = _kick_http("GET", f"{KICK_API}/events/subscriptions?broadcaster_user_id={bid}", token)
+    if st == 200 and isinstance(d, dict) and isinstance(d.get("data"), list):
+        for s in d["data"]:
+            if not isinstance(s, dict): continue
+            nombre = s.get("event") or s.get("name") or s.get("type")
+            dueno = s.get("broadcaster_user_id")
+            if nombre and (dueno is None or str(dueno) == str(bid)): existentes.add(str(nombre))
+    faltan = [(n, v) for n, v in KICK_EVENTOS if n not in existentes]
+    if not faltan: return []
+    st, d = _kick_http("POST", f"{KICK_API}/events/subscriptions", token, json_body={
+        "broadcaster_user_id": bid, "method": "webhook",
+        "events": [{"name": n, "version": v} for n, v in faltan]})
+    if st in (401, 403):
+        raise RuntimeError(f"Kick rechazó la suscripción (HTTP {st}). Puede que exija un token de usuario con el permiso "
+                           f"events:subscribe en lugar del token de aplicación. {_resumen(d)}")
+    if st not in (200, 201):
+        raise RuntimeError(f"No se pudo suscribir a los eventos (HTTP {st}). {_resumen(d)}")
+    errores = []
+    for r in (d.get("data") if isinstance(d, dict) else None) or []:
+        if isinstance(r, dict) and r.get("error"): errores.append(f"{r.get('name')}: {r['error']}")
+    return errores
+
+# ---------------- Eventos de Kick -> chat.txt ----------------
+def _kick_nombre(persona, defecto="alguien"):
+    if not isinstance(persona, dict): return defecto
+    n = persona.get("username") or persona.get("channel_slug") or ""
+    n = str(n).replace("@", "").replace("|", " ").replace("\n", " ").replace("\r", " ").strip()
+    return n or defecto
+
+def _kick_regalo(frase, emisor, cantidad, valor):
+    frase = frase.replace("|", " ").replace("\n", " ").strip()
+    emisor = (emisor or "alguien").replace("|", " ").strip() or "alguien"
+    linea = f"__REGALO__|{frase}|{emisor}|{max(1, int(cantidad))}|{max(1, int(valor))}"
+    with _lock:
+        with open(CHAT_FILE, "a", encoding="utf-8") as f: f.write(linea + "\n")
+    print(f"[KICK REGALO] {emisor} -> {frase}")
+
+def _kick_evento(tipo, d):
+    global _ultima_bienvenida
+    slug = KICK_CFG["canal"].lower()
+
+    if tipo == "chat.message.sent":
+        s = d.get("sender") or {}
+        nombre = _kick_nombre(s, "")
+        if not nombre: return
+        uid = nombre.lower()
+        texto = PATRON_EMOTE_KICK.sub("", str(d.get("content") or ""))
+        texto = re.sub(r"\s+", " ", texto).strip()
+        registrar_usuario(uid, nombre)
+        es_dueno = uid == slug or str(s.get("channel_slug", "")).lower() == slug
+        if DAR_BIENVENIDA and not es_dueno:
+            ahora = time.time()
+            if ahora - _ultima_bienvenida >= COOLDOWN_BIENVENIDA and _recordar(_bienvenidos, uid):
+                _ultima_bienvenida = ahora
+                print(f"[KICK BIENVENIDA] {nombre}")
+                _escribir_evento("BIENVENIDA", nombre)
+        caja = [texto]
+        if es_comentario_valido(uid, caja):
+            print(f"[KICK] {uid}: {caja[0]}")
+            escribir_chat(uid, caja[0])
+        else:
+            print(f"[IGNORADO KICK] {uid}: {texto}")
+
+    elif tipo == "channel.followed":
+        if not AGRADECER_SEGUIDORES: return
+        nombre = _kick_nombre(d.get("follower"), "")
+        if not nombre: return
+        uid = nombre.lower()
+        registrar_usuario(uid, nombre)
+        if uid == slug or not _recordar(_seguidores_agradecidos, uid): return
+        print(f"[KICK SEGUIDOR] {nombre}")
+        _escribir_evento("SEGUIDOR", nombre)
+
+    elif tipo in ("channel.subscription.new", "channel.subscription.renewal"):
+        nombre = _kick_nombre(d.get("subscriber"), "alguien")
+        frase = "la Suscripción" if tipo.endswith(".new") else "la renovación de la Suscripción"
+        _kick_regalo(frase, nombre, 1, 1)
+
+    elif tipo == "channel.subscription.gifts":
+        g = d.get("gifter") or {}
+        anonimo = isinstance(g, dict) and bool(g.get("is_anonymous"))
+        nombre = "alguien" if anonimo else _kick_nombre(g, "alguien")
+        giftees = d.get("giftees")
+        n = len(giftees) if isinstance(giftees, list) and giftees else 1
+        frase = "una Suscripción regalada" if n <= 1 else f"enviar {n} Suscripciones regaladas"
+        _kick_regalo(frase, nombre, n, 1)
+
+    elif tipo == "kicks.gifted":
+        s = d.get("sender") or d.get("gifter") or {}
+        anonimo = isinstance(s, dict) and bool(s.get("is_anonymous"))
+        nombre = "alguien" if anonimo else _kick_nombre(s, "alguien")
+        regalo = d.get("gift") or {}
+        try: monto = max(1, int(regalo.get("amount") or 1))
+        except (TypeError, ValueError): monto = 1
+        _kick_regalo(formatear_regalo(str(regalo.get("name") or "KICKs"), 1), nombre, 1, monto)
+
+def kick_procesar_webhook(cab, cuerpo):
+    """Valida un webhook de Kick y lo procesa. Devuelve (código_http, texto)."""
+    firma_b64 = cab.get("Kick-Event-Signature")
+    msg_id    = cab.get("Kick-Event-Message-Id")
+    ts        = cab.get("Kick-Event-Message-Timestamp")
+    tipo      = cab.get("Kick-Event-Type")
+    if not (firma_b64 and msg_id and ts and tipo): return 400, "faltan cabeceras"
+
+    if _kick["clave"] is None:
+        try: _kick_cargar_clave(_kick["token"])
+        except Exception as e:
+            print(f"[KICK] No se pudo cargar la clave pública para verificar: {e}")
+            return 503, "clave no disponible"
+    try:
+        firma = base64.b64decode(firma_b64, validate=True)
+        firmado = f"{msg_id}.{ts}.".encode("utf-8") + cuerpo
+        valido = _rsa_verificar(_kick["clave"], firmado, firma)
+    except Exception:
+        valido = False
+    if not valido:
+        print("[KICK] Webhook rechazado: firma inválida.")
+        return 400, "firma inválida"
+
+    try: edad = abs(time.time() - _rfc3339_a_epoch(ts))
+    except ValueError: return 400, "timestamp inválido"
+    if edad > KICK_TOLERANCIA_SEG:
+        print(f"[KICK] Webhook rechazado por antigüedad ({int(edad)}s). Si pasa siempre, revisa la hora de tu PC.")
+        return 400, "antiguo"
+
+    try: datos = json.loads(cuerpo.decode("utf-8"))
+    except Exception: return 400, "json inválido"
+    if not isinstance(datos, dict): return 400, "json inválido"
+
+    # La firma es la misma para todas las apps de Kick: solo se aceptan eventos de NUESTRO canal.
+    bro = datos.get("broadcaster")
+    bro_id = bro.get("user_id") if isinstance(bro, dict) else None
+    if _kick["broadcaster_id"] is None or str(bro_id) != str(_kick["broadcaster_id"]):
+        print(f"[KICK] Webhook ignorado: no es de este canal (broadcaster {bro_id}).")
+        return 200, "otro canal"
+
+    with _lock_kick:
+        if msg_id in _kick_ids_vistos: return 200, "duplicado"
+        _kick_ids_vistos[msg_id] = True
+        while len(_kick_ids_vistos) > 2000: _kick_ids_vistos.popitem(last=False)
+        try: _kick_evento(tipo, datos)
+        except Exception as e: print(f"[KICK] Error procesando {tipo}: {type(e).__name__}: {e}")
+    return 200, "ok"
+
+class KickH(BaseHTTPRequestHandler):
+    timeout = 15
+    def _resp(self, codigo, texto="ok"):
+        cuerpo = texto.encode("utf-8")
+        self.send_response(codigo)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+    def do_GET(self): self._resp(200, "puente kick activo")
+    def do_POST(self):
+        try: largo = int(self.headers.get("Content-Length", "0"))
+        except ValueError: largo = 0
+        if largo <= 0: return self._resp(400, "sin cuerpo")
+        if largo > 262144: return self._resp(413, "demasiado grande")
+        codigo, texto = kick_procesar_webhook(self.headers, self.rfile.read(largo))
+        self._resp(codigo, texto)
+    def log_message(self, format, *args): return
+
+def iniciar_http_kick():
+    puerto = _kick_puerto()
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", puerto), KickH)
+    except OSError as e:
+        print(f"[KICK] No se pudo abrir el puerto {puerto}: {e}")
+        return
+    srv.daemon_threads = True
+    print(f"[KICK] Receptor de webhooks en http://127.0.0.1:{puerto}  (apunta tu túnel a este puerto)")
+    srv.serve_forever()
+
+async def monitor_kick():
+    fallos = 0
+    while True:
+        try:
+            token = await asyncio.to_thread(_kick_obtener_token)
+            if _kick["broadcaster_id"] is None:
+                _kick["broadcaster_id"] = await asyncio.to_thread(_kick_resolver_canal, token)
+                print(f"[KICK] Canal '{KICK_CFG['canal']}' encontrado (id {_kick['broadcaster_id']}).")
+            if _kick["clave"] is None:
+                await asyncio.to_thread(_kick_cargar_clave, token)
+            errores = await asyncio.to_thread(_kick_asegurar_suscripciones, token, _kick["broadcaster_id"])
+            for e in errores: print(f"[KICK] Suscripción con error -> {e}")
+            if not errores:
+                print(f"[KICK] Suscripciones activas. Recuerda: Webhook URL en kick.com/settings/developer = "
+                      f"URL pública de tu túnel (que apunte al puerto {_kick_puerto()}).")
+            fallos = 0
+            espera = KICK_REVISION_SEG
+        except asyncio.CancelledError: raise
+        except Exception as e:
+            fallos += 1
+            espera = min(30 * (2 ** (fallos - 1)), 300)
+            print(f"[KICK] Error: {e}")
+            print(f"[KICK] Ajustes de tu app en kick.com/settings/developer:\n"
+                  f"[KICK]   - Redirigir URL        : http://127.0.0.1:{_kick_puerto()}\n"
+                  f"[KICK]   - Habilitar webhooks   : ACTIVADO, con la URL pública del túnel (https://....trycloudflare.com)\n"
+                  f"[KICK]   - Scope obligatorio    : \"Suscríbete a los eventos\"\n"
+                  f"[KICK]   - Client ID / Secret   : los de esa misma app (botón Live del Dashboard)")
+            print(f"[KICK] Reintentando en {espera}s...")
+        await asyncio.sleep(espera)
+
+def tiktok_configurado():
+    """True si la plataforma incluye TikTok y hay un usuario real (no el de relleno)."""
+    if PLATAFORMA not in ("tiktok", "ambas"): return False
+    return any(not re.fullmatch(r"x+", (u or "x"), re.IGNORECASE) for u in TIKTOK_USERS)
+
 async def iniciar_todos():
     tarea_monitor_tiktok = None
     tarea_twitch = None
@@ -1011,6 +1457,20 @@ async def iniciar_todos():
     else:
         print("[AVISO] Twitch no configurado. Revisa twitch_config.txt.")
 
+    tarea_kick = None
+    if kick_activo():
+        print(f"[KICK] Iniciando conexión al canal {KICK_CFG['canal']}...")
+        tarea_kick = asyncio.create_task(monitor_kick())
+    elif PLATAFORMA in ("kick", "ambas"):
+        print("[AVISO] Kick no configurado. Revisa kick_config.txt (client_id, client_secret y canal).")
+    else:
+        print("[MODO] Plataforma TikTok: Kick desactivado.")
+
+    if PLATAFORMA == "kick":
+        print("[MODO] Plataforma Kick: TikTok desactivado.")
+    elif not tiktok_configurado():
+        print("[AVISO] Usuario de TikTok sin configurar: se omite la conexión a TikTok.")
+
     while True:
         try:
             if _tikfinity_activo():
@@ -1021,7 +1481,7 @@ async def iniciar_todos():
                     except Exception: pass
                     tarea_monitor_tiktok = None
             else:
-                if tarea_monitor_tiktok is None or tarea_monitor_tiktok.done():
+                if tiktok_configurado() and (tarea_monitor_tiktok is None or tarea_monitor_tiktok.done()):
                     print(f"[MODO] Sin TikFinity - conectando directo a TikTok Live...")
                     usuarios_tareas = [asyncio.create_task(monitor_usuario(u)) for u in TIKTOK_USERS]
                     tarea_monitor_tiktok = asyncio.gather(*usuarios_tareas, return_exceptions=True)
@@ -1047,10 +1507,14 @@ if __name__ == "__main__":
     except Exception: pass
 
     print("=" * 60)
-    print(f"Usuarios TikTok : {', '.join('@'+u for u in TIKTOK_USERS)}")
+    if PLATAFORMA != "kick":
+        print(f"Usuarios TikTok : {', '.join('@'+u for u in TIKTOK_USERS)}")
     if TWITCH_DISPONIBLE and TWITCH_CFG.get("canal"):
         print(f"Canal Twitch    : {TWITCH_CFG['canal']}")
     else: print(f"Canal Twitch    : NO CONFIGURADO")
+    print(f"Plataforma      : {PLATAFORMA.upper()}")
+    if kick_activo(): print(f"Canal Kick      : {KICK_CFG['canal']}  (webhooks en puerto {_kick_puerto()})")
+    elif PLATAFORMA in ("kick", "ambas"): print(f"Canal Kick      : NO CONFIGURADO")
     print(f"Archivo salida  : {CHAT_FILE}")
     print(f"Puerto HTTP     : {HTTP_PORT}")
     print(f"Modo            : HÍBRIDO MULTI-PLATAFORMA")
@@ -1059,6 +1523,8 @@ if __name__ == "__main__":
     t = threading.Thread(target=iniciar_http, daemon=True)
     t.start()
     threading.Thread(target=_flush_taps_loop, daemon=True).start()
+    if kick_activo():
+        threading.Thread(target=iniciar_http_kick, daemon=True).start()
 
     try: asyncio.run(iniciar_todos())
     except KeyboardInterrupt: print("\n[PUENTE] Detenido por el usuario.")
