@@ -1201,10 +1201,17 @@ def _kick_obtener_token():
 
 def _kick_resolver_canal(token):
     slug = KICK_CFG["canal"]
-    st, d = _kick_http("GET", f"{KICK_API}/channels?slug={urllib.parse.quote(slug)}", token)
-    datos = d.get("data") if isinstance(d, dict) else None
-    if isinstance(datos, list): datos = datos[0] if datos else None
-    bid = datos.get("broadcaster_user_id") if isinstance(datos, dict) else None
+    # Kick cambia los "_" del nombre por "-" en la URL (kick.com/sr-galan), así que se prueban ambas formas.
+    variantes = [slug]
+    for v in (slug.replace("_", "-"), slug.replace("-", "_")):
+        if v not in variantes: variantes.append(v)
+    bid, st, d = None, 0, None
+    for v in variantes:
+        st, d = _kick_http("GET", f"{KICK_API}/channels?slug={urllib.parse.quote(v)}", token)
+        datos = d.get("data") if isinstance(d, dict) else None
+        if isinstance(datos, list): datos = datos[0] if datos else None
+        bid = datos.get("broadcaster_user_id") if isinstance(datos, dict) else None
+        if st == 200 and bid: break
     if st != 200 or not bid:
         raise RuntimeError(f"No se encontró el canal '{slug}' en Kick (HTTP {st}). Usa el nombre exacto de kick.com/<canal>. {_resumen(d)}")
     return int(bid)
@@ -1270,7 +1277,7 @@ def _kick_regalo(frase, emisor, cantidad, valor):
 
 def _kick_evento(tipo, d):
     global _ultima_bienvenida
-    slug = KICK_CFG["canal"].lower()
+    slug = KICK_CFG["canal"].lower().replace("-", "_")
 
     if tipo == "chat.message.sent":
         s = d.get("sender") or {}
@@ -1280,7 +1287,7 @@ def _kick_evento(tipo, d):
         texto = PATRON_EMOTE_KICK.sub("", str(d.get("content") or ""))
         texto = re.sub(r"\s+", " ", texto).strip()
         registrar_usuario(uid, nombre)
-        es_dueno = uid == slug or str(s.get("channel_slug", "")).lower() == slug
+        es_dueno = uid.replace("-", "_") == slug or str(s.get("channel_slug", "")).lower().replace("-", "_") == slug
         if DAR_BIENVENIDA and not es_dueno:
             ahora = time.time()
             if ahora - _ultima_bienvenida >= COOLDOWN_BIENVENIDA and _recordar(_bienvenidos, uid):
@@ -1300,7 +1307,7 @@ def _kick_evento(tipo, d):
         if not nombre: return
         uid = nombre.lower()
         registrar_usuario(uid, nombre)
-        if uid == slug or not _recordar(_seguidores_agradecidos, uid): return
+        if uid.replace("-", "_") == slug or not _recordar(_seguidores_agradecidos, uid): return
         print(f"[KICK SEGUIDOR] {nombre}")
         _escribir_evento("SEGUIDOR", nombre)
 
